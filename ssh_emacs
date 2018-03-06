@@ -1,0 +1,107 @@
+#!/bin/bash
+
+# For each existing ControlMaster socket found in ~/.ssh/cm_sock, make
+# sure a remote port is forwarded to 9999 on this host.
+#
+# We do that with
+#
+#   ssh -q -R 0:localhost:9999  -O forward user@host
+#
+# which will print the value of the chosen remote port on stdout. The
+# beautiful thing is that if the connection already has a remote
+# forward to localhost:9999 established, it won't create another,
+# making this idempotent. (The not so beautiful thing is that we'll
+# also get "Allocated port 41018 for mux remote forward to
+# localhost:9999" printed on the tty which originally created the
+# ControlMaster, but I don't know how to quelch that.)
+#
+# We will then use that port number to create an emacs server file on
+# the remote, which our ecn (short for 'emacsclient -n) script can use
+# to establish a (tcp) connection to our running emacs
+# instance. Basically, an emacs server file contains host:port along
+# with a magic 64 byte cookie which is used as a poor man's
+# authentication. So we need to copy this host's emacs server file to
+# the remote host, editing the port number to reflect the chosen port
+# number on the remote host.
+
+serverfile="${HOME}/.emacs.d/server/server"
+
+if [[ ! -e "${serverfile}" ]]; then
+    echo "server file ${serverfile} not found" > /dev/stderr
+    exit 1
+fi
+
+read localip localport pid <<<$(head -n1 "${serverfile}" | tr : ' ')
+
+# Sanity check: There should be an existing emacs instance with that
+# pid
+if ! grep -q emacs "/proc/${pid}/comm" 2> /dev/null ; then
+    echo "no emacs with pid ${pid}" > /dev/stderr
+    exit 1
+fi
+
+copy_server_file() {
+    local sock="$1"
+    local base=$(basename "$sock")
+    # XXX: should probably do more thorough regexp matching. Even
+    # better would be the ability to ask the control master for these
+    # values.
+    local user=${base%@*}
+    local host=${base#*@}
+    local port=${host#*:}
+    host=${host%:*}
+
+    # separate declaration; otherwise $? below would refer to the
+    # obviously succesful "local" command, not to the command inside
+    # $().
+    local remoteport
+    remoteport=$(ssh -q -R "0:${localip}:${localport}" -O forward -S "${sock}" -p "${port}" "${user}@${host}")
+
+    if [[ $? -ne 0 ]] ; then
+	echo "failed to obtain remote port forward for ${sock}" > /dev/stderr
+	return
+    fi
+    # Hm, somehow subsequent ssh commands ends up echoing 0 when the
+    # dynamic selection failed, and exit succesfully. So we better
+    # check for that as well.
+    if [[ -z "$remoteport" || "$remoteport" -eq "0" ]] ; then
+	echo "previously failed to obtain remote port forward for ${sock}" > /dev/stderr
+	return
+    fi
+
+    local tmpfile=$(mktemp)
+
+    cp "${serverfile}" "${tmpfile}" || return
+    sed -i "s/${localip}:${localport}/127.0.0.1:${remoteport}/" "${tmpfile}" || return
+
+    # The ecn script will look for a server file at
+    # ~/.emacs.d/server/remote-server, so copy the server file to that
+    # location; but make sure the .emacs.d/server directory exists
+    # first. In the future, I might decide to, in a sense, reverse the
+    # logic: Only copy the server file if that directory already
+    # exists (as that would be my way of indicating that this is a box
+    # where I do development work, as opposed to one of the gazillion
+    # small gadgets I ssh into as part of my work); or maybe check for
+    # the existence of the ecn script itself in ~/bin.
+    #
+    # We also need to provide the ecn script with another piece of
+    # information, namely what name we know the remote host
+    # under. That's needed because ecn needs to prepend all files with
+    # a suitable ssh:// path so that the local emacs can actually open
+    # the file.
+    #
+    # We could put this information in a separate file, but it's
+    # slightly simpler to put it in the server file itself. The format
+    # of that file is completely undocumented, but reading the source
+    # (function get_server_config in lib-src/emacsclient.c) shows that
+    # it should be ok to append arbitrary stuff to it.
+    printf "\n%s@%s\n" "${user}" "${host}" >> "${tmpfile}"
+    ssh -S "${sock}" "${user}@${host}" "mkdir -p ~/.emacs.d/server" < /dev/null
+    scp -o "ControlPath=${sock}" "${tmpfile}" "${user}@${host}:~/.emacs.d/server/remote-server" > /dev/null
+
+    rm -f "${tmpfile}"
+}
+
+find "${HOME}/.ssh/cm_sock" -type s -print | \
+    while read s ; do copy_server_file "${s}" ; done
+
